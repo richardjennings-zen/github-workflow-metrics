@@ -111,6 +111,7 @@ func workflowStats(ctx context.Context, client *github.Client, owner string, rep
 }
 
 func createTimeSeries(w *github.WorkflowRun, js *github.Jobs) (t []prompb.TimeSeries) {
+	now := time.Now().UnixMilli()
 	metricLabel := prompb.Label{Name: "__name__", Value: "workflow_duration"}
 	workflowLabel := prompb.Label{Name: "workflow_name", Value: w.GetName()}
 	workflowIdLabel := prompb.Label{Name: "workflow_id", Value: strconv.FormatInt(w.GetID(), 10)}
@@ -118,7 +119,7 @@ func createTimeSeries(w *github.WorkflowRun, js *github.Jobs) (t []prompb.TimeSe
 	t = append(t, prompb.TimeSeries{
 		Labels: []prompb.Label{metricLabel, workflowLabel, workflowIdLabel},
 		Samples: []prompb.Sample{{
-			Timestamp: time.Now().UnixMilli(),
+			Timestamp: now,
 			Value:     w.GetUpdatedAt().Time.Sub(w.GetCreatedAt().Time).Seconds(),
 		}},
 	})
@@ -128,7 +129,7 @@ func createTimeSeries(w *github.WorkflowRun, js *github.Jobs) (t []prompb.TimeSe
 		t = append(t, prompb.TimeSeries{
 			Labels: []prompb.Label{metricLabel, workflowLabel, workflowIdLabel, jLabel},
 			Samples: []prompb.Sample{{
-				Timestamp: time.Now().UnixMilli(),
+				Timestamp: now,
 				Value:     j.GetCompletedAt().Time.Sub(j.GetStartedAt().Time).Seconds(),
 			}},
 		})
@@ -138,7 +139,7 @@ func createTimeSeries(w *github.WorkflowRun, js *github.Jobs) (t []prompb.TimeSe
 			t = append(t, prompb.TimeSeries{
 				Labels: []prompb.Label{metricLabel, workflowLabel, workflowIdLabel, jLabel, sLabel},
 				Samples: []prompb.Sample{{
-					Timestamp: time.Now().UnixMilli(),
+					Timestamp: now,
 					Value:     s.GetCompletedAt().Time.Sub(s.GetStartedAt().Time).Seconds(),
 				}},
 			})

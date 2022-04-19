@@ -27,11 +27,12 @@ func main() {
 	c := client(conf.githubToken)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
-	ws, err := workflowStats(ctx, c, conf.githubOwner, conf.githubRepo, conf.githubRunId)
+	ws, js, err := workflowStats(ctx, c, conf.githubOwner, conf.githubRepo, conf.githubRunId)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := pushMetrics(ctx, ws, conf.remoteWriteUrl, conf.remoteWriteUsername, conf.remoteWritePassword); err != nil {
+	ts := createTimeSeries(ws, js)
+	if err := pushMetrics(ctx, ts, conf); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -50,25 +51,6 @@ type (
 		config() (conf, error)
 	}
 	EnvConfigProvider struct{}
-	StepStats         struct {
-		Name  string
-		Start time.Time
-		End   time.Time
-	}
-	JobStats struct {
-		Name  string
-		Start time.Time
-		End   time.Time
-		Steps []StepStats
-	}
-	WorkflowStats struct {
-		Id    int64
-		Name  string
-		Start time.Time
-		End   time.Time
-		Jobs  []JobStats
-		T     int
-	}
 )
 
 func (e EnvConfigProvider) config() (conf, error) {
@@ -119,40 +101,55 @@ func client(token string) *github.Client {
 	return github.NewClient(nil)
 }
 
-func workflowStats(ctx context.Context, client *github.Client, owner string, repo string, runId int64) (WorkflowStats, error) {
-	ws := WorkflowStats{}
+func workflowStats(ctx context.Context, client *github.Client, owner string, repo string, runId int64) (*github.WorkflowRun, *github.Jobs, error) {
 	workflow, _, err := client.Actions.GetWorkflowRunByID(ctx, owner, repo, runId)
 	if err != nil {
-		return ws, err
+		return workflow, nil, err
 	}
-	ws.Id = runId
-	ws.Start = workflow.GetCreatedAt().Time
-	ws.End = workflow.GetUpdatedAt().Time
-	ws.T++
-	ws.Name = workflow.GetName()
 	jobs, _, err := client.Actions.ListWorkflowJobs(ctx, owner, repo, runId, &github.ListWorkflowJobsOptions{})
-	for _, job := range jobs.Jobs {
-		ws.T++
-		j := JobStats{}
-		j.Name = job.GetName()
-		j.Start = job.GetStartedAt().Time
-		j.End = job.GetCompletedAt().Time
-		for _, step := range job.Steps {
-			ws.T++
-			s := StepStats{}
-			s.Name = step.GetName()
-			s.Start = step.GetStartedAt().Time
-			s.End = step.GetCompletedAt().Time
-			j.Steps = append(j.Steps, s)
-		}
-		ws.Jobs = append(ws.Jobs, j)
-	}
-	return ws, nil
+	return workflow, jobs, err
 }
 
-func pushMetrics(ctx context.Context, w WorkflowStats, uri string, username string, password string) (err error) {
+func createTimeSeries(w *github.WorkflowRun, js *github.Jobs) (t []prompb.TimeSeries) {
+	metricLabel := prompb.Label{Name: "__name__", Value: "workflow_duration"}
+	workflowLabel := prompb.Label{Name: "workflow_name", Value: w.GetName()}
+	workflowIdLabel := prompb.Label{Name: "workflow_id", Value: strconv.FormatInt(w.GetID(), 10)}
+	// add workflow metric
+	t = append(t, prompb.TimeSeries{
+		Labels: []prompb.Label{metricLabel, workflowLabel, workflowIdLabel},
+		Samples: []prompb.Sample{{
+			Timestamp: time.Now().UnixMilli(),
+			Value:     w.GetUpdatedAt().Time.Sub(w.GetCreatedAt().Time).Seconds(),
+		}},
+	})
+	for _, j := range js.Jobs {
+		jLabel := prompb.Label{Name: "job_name", Value: j.GetName()}
+		// add job metric
+		t = append(t, prompb.TimeSeries{
+			Labels: []prompb.Label{metricLabel, workflowLabel, workflowIdLabel, jLabel},
+			Samples: []prompb.Sample{{
+				Timestamp: time.Now().UnixMilli(),
+				Value:     j.GetCompletedAt().Time.Sub(j.GetStartedAt().Time).Seconds(),
+			}},
+		})
+		for _, s := range j.Steps {
+			sLabel := prompb.Label{Name: "step", Value: s.GetName()}
+			// add step metrics
+			t = append(t, prompb.TimeSeries{
+				Labels: []prompb.Label{metricLabel, workflowLabel, workflowIdLabel, jLabel, sLabel},
+				Samples: []prompb.Sample{{
+					Timestamp: time.Now().UnixMilli(),
+					Value:     s.GetCompletedAt().Time.Sub(s.GetStartedAt().Time).Seconds(),
+				}},
+			})
+		}
+	}
+	return
+}
+
+func pushMetrics(ctx context.Context, ts []prompb.TimeSeries, cnf conf) (err error) {
 	var endpoint *url.URL
-	if endpoint, err = url.Parse(uri); err != nil {
+	if endpoint, err = url.Parse(cnf.remoteWriteUrl); err != nil {
 		return err
 	}
 	c, err := remote.NewWriteClient(
@@ -162,61 +159,13 @@ func pushMetrics(ctx context.Context, w WorkflowStats, uri string, username stri
 			Timeout: model.Duration(30 * time.Second),
 			HTTPClientConfig: config.HTTPClientConfig{
 				BasicAuth: &config.BasicAuth{
-					Username: username,
-					Password: config.Secret(password),
+					Username: cnf.remoteWriteUsername,
+					Password: config.Secret(cnf.remoteWritePassword),
 				},
 			},
 		},
 	)
-	writeReq := &prompb.WriteRequest{
-		Timeseries: make([]prompb.TimeSeries, w.T),
-	}
-
-	// add workflow metric
-	metricLabel := prompb.Label{
-		Name:  "__name__",
-		Value: "workflow_duration",
-	}
-	workflowLabel := prompb.Label{
-		Name:  "workflow",
-		Value: w.Name,
-	}
-	workflowIdLabel := prompb.Label{
-		Name:  "workflow_id",
-		Value: strconv.FormatInt(w.Id, 10),
-	}
-	writeReq.Timeseries[0].Labels = []prompb.Label{metricLabel, workflowLabel, workflowIdLabel}
-	writeReq.Timeseries[0].Samples = []prompb.Sample{
-		{
-			Timestamp: time.Now().UnixMilli(),
-			Value:     float64(w.End.Sub(w.Start).Milliseconds()),
-		},
-	}
-	t := 1 // count of metrics processed so far
-	for _, j := range w.Jobs {
-		jLabel := prompb.Label{Name: "job", Value: j.Name}
-		// add job metric
-		writeReq.Timeseries[t].Labels = []prompb.Label{metricLabel, workflowLabel, workflowIdLabel, jLabel}
-		writeReq.Timeseries[t].Samples = []prompb.Sample{
-			{
-				Timestamp: time.Now().UnixMilli(),
-				Value:     float64(j.End.Sub(j.Start).Milliseconds()),
-			},
-		}
-		t++
-		for _, s := range j.Steps {
-			sLabel := prompb.Label{Name: "step", Value: j.Name}
-			// add step metrics
-			writeReq.Timeseries[t].Labels = []prompb.Label{metricLabel, workflowLabel, workflowIdLabel, jLabel, sLabel}
-			writeReq.Timeseries[t].Samples = []prompb.Sample{
-				{
-					Timestamp: time.Now().UnixMilli(),
-					Value:     float64(s.End.Sub(s.Start).Milliseconds()),
-				},
-			}
-			t++
-		}
-	}
+	writeReq := &prompb.WriteRequest{Timeseries: ts}
 	data, err := proto.Marshal(writeReq)
 	if err != nil {
 		return fmt.Errorf("unable to marshal protobuf: %v", err)
